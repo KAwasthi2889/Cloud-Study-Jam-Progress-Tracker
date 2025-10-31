@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,38 +27,54 @@ var requiredBadges = []string{
 	"Build a Website on Google Cloud",
 	"Set Up a Google Cloud Network",
 	"Store, Process, and Manage Data on Google Cloud - Console",
-	"Cloud Run Functions: 3 Ways", // ✅ Updated name
+	"Cloud Run Functions: 3 Ways",
 	"App Engine: 3 Ways",
 	"Cloud Speech API: 3 Ways",
 	"Monitoring in Google Cloud",
 	"Analyze Speech and Language with Google APIs",
 	"Prompt Design in Vertex AI",
-	"Develop Gen AI Apps with Gemini and Streamlit", // ✅ Updated name
+	"Develop Gen AI Apps with Gemini and Streamlit",
 	"Level 3: Generative AI",
 }
 
+// normalize returns a simplified lowercase version of the string.
 func normalize(s string) string {
 	s = strings.ToLower(s)
 	re := regexp.MustCompile(`[^a-z0-9]+`)
 	return re.ReplaceAllString(s, "")
 }
 
-// Scrape badge names from a user's Skills Boost profile
-func getBadges(profileURL string) ([]string, error) {
+// capitalizeWords makes the first letter of each word uppercase.
+func capitalizeWords(s string) string {
+	words := strings.Fields(s)
+	for i, w := range words {
+		words[i] = strings.Title(strings.ToLower(w))
+	}
+	return strings.Join(words, " ")
+}
+
+// getBadges scrapes badges and participant name from a profile URL.
+func getBadges(profileURL string) ([]string, string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(profileURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch profile: %v", err)
+		return nil, "", fmt.Errorf("failed to fetch profile: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse HTML: %v", err)
+		return nil, "", fmt.Errorf("failed to parse HTML: %v", err)
+	}
+
+	// Extract participant name
+	name := strings.TrimSpace(doc.Find("h1.ql-display-small").First().Text())
+	if name != "" {
+		name = capitalizeWords(name)
 	}
 
 	var badges []string
@@ -67,10 +84,13 @@ func getBadges(profileURL string) ([]string, error) {
 			badges = append(badges, title)
 		}
 	})
-	return badges, nil
+
+	return badges, name, nil
 }
 
 func main() {
+	start := time.Now()
+
 	file, err := os.Open("participants.csv")
 	if err != nil {
 		log.Fatalf("Failed to open CSV: %v", err)
@@ -89,30 +109,35 @@ func main() {
 		requiredMap[normalize(name)] = true
 	}
 
-	completedAll := []string{}
-	someLabsLeft := []string{}
-	onlyArcadeLeft := []string{}
+	var completedAll, someLabsLeft, onlyArcadeLeft [][]string
 
 	for i, row := range records {
 		if i == 0 {
-			continue // skip header
+			continue
 		}
 		if len(row) < 7 {
 			continue
 		}
 
-		name := strings.TrimSpace(row[0])
+		csvName := strings.TrimSpace(row[0])
 		url := strings.TrimSpace(row[6])
 		if url == "" {
 			continue
 		}
 
-		fmt.Printf("\n🔹 Checking %s\n", name)
+		fmt.Printf("Checking profile: %s\n", csvName)
 
-		badges, err := getBadges(url)
+		badges, scrapedName, err := getBadges(url)
 		if err != nil {
-			fmt.Printf("  ❌ Error fetching profile: %v\n", err)
+			fmt.Printf("  Error fetching profile: %v\n", err)
 			continue
+		}
+
+		name := csvName
+		if scrapedName != "" {
+			name = scrapedName
+		} else {
+			name = capitalizeWords(csvName)
 		}
 
 		userBadges := make(map[string]bool)
@@ -131,33 +156,49 @@ func main() {
 			}
 		}
 
-		fmt.Printf("  ✅ Total relevant badges: %d\n", total)
-
 		switch {
 		case total == 20:
-			completedAll = append(completedAll, name)
+			completedAll = append(completedAll, []string{name, url})
 		case hasLevel3 && total > 13:
-			someLabsLeft = append(someLabsLeft, name)
+			someLabsLeft = append(someLabsLeft, []string{name, url})
 		case !hasLevel3 && total == 19:
-			onlyArcadeLeft = append(onlyArcadeLeft, name)
+			onlyArcadeLeft = append(onlyArcadeLeft, []string{name, url})
 		}
-
-		time.Sleep(2 * time.Second) // gentle delay
 	}
 
-	fmt.Printf("\n\n===== RESULTS =====\n")
-	fmt.Printf("\nCompleted everything (%d):\n", len(completedAll))
-	for _, n := range completedAll {
-		fmt.Printf("  - %s\n", n)
+	// Sort alphabetically by name
+	sort.Slice(completedAll, func(i, j int) bool { return completedAll[i][0] < completedAll[j][0] })
+	sort.Slice(someLabsLeft, func(i, j int) bool { return someLabsLeft[i][0] < someLabsLeft[j][0] })
+	sort.Slice(onlyArcadeLeft, func(i, j int) bool { return onlyArcadeLeft[i][0] < onlyArcadeLeft[j][0] })
+
+	fmt.Printf("\n===== RESULTS =====\n")
+	fmt.Printf("Completed Everything: %d\n", len(completedAll))
+	fmt.Printf("Some Labs Left: %d\n", len(someLabsLeft))
+	fmt.Printf("Only Arcade Left: %d\n", len(onlyArcadeLeft))
+
+	out, err := os.Create("results.csv")
+	if err != nil {
+		log.Fatalf("Failed to create results.csv: %v", err)
+	}
+	defer out.Close()
+	writer := csv.NewWriter(out)
+
+	writeGroup := func(title string, entries [][]string) {
+		if len(entries) == 0 {
+			return
+		}
+		writer.Write([]string{fmt.Sprintf("# %s (%d)", title, len(entries))})
+		writer.Write([]string{"Name", "Profile URL"})
+		for _, row := range entries {
+			writer.Write(row)
+		}
+		writer.Write([]string{})
 	}
 
-	fmt.Printf("\nSome Labs Left (%d):\n", len(someLabsLeft))
-	for _, n := range someLabsLeft {
-		fmt.Printf("  - %s\n", n)
-	}
+	writeGroup("Completed Everything", completedAll)
+	writeGroup("Some Labs Left", someLabsLeft)
+	writeGroup("Only Arcade Left", onlyArcadeLeft)
+	writer.Flush()
 
-	fmt.Printf("\nOnly arcade left (%d):\n", len(onlyArcadeLeft))
-	for _, n := range onlyArcadeLeft {
-		fmt.Printf("  - %s\n", n)
-	}
+	fmt.Printf("\nProgram finished in %v\n", time.Since(start).Round(time.Second))
 }
